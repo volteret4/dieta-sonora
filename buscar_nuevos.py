@@ -1,0 +1,166 @@
+import requests
+import csv
+import zlib
+import json
+import time
+import os
+from datetime import datetime
+from tools.sops_env import load_sops_env
+from ya_lo_tengo import qb_torrent_names, ya_lo_tengo
+
+try:
+    load_sops_env()
+except FileNotFoundError:
+    # En Docker las variables llegan ya descifradas vía docker-compose (scripts/up.sh)
+    pass
+
+API_KEY = os.getenv("NAS_API_KEY")
+NAS_URL = os.getenv("NAS_URL", "").rstrip("/")
+BASE_URL = f"{NAS_URL}/ajax.php"
+JSON_FILENAME = "resultado_flacs.json"
+CSV_FILENAME = "albums.csv"
+
+HEADERS = {
+    "Authorization": API_KEY
+}
+
+
+
+
+def obtener_keys():
+    try:
+        r = requests.get(BASE_URL, headers=HEADERS, params={"action": "index"}, timeout=10)
+        if r.status_code != 200:
+            print(f" Error {r.status_code}: Credenciales inválidas o baneo temporal.")
+            return None, None
+        data = r.json()
+        if data.get("status") != "success":
+            print(f" La API respondió error: {data.get('error')}")
+            return None, None
+        return data["response"]["authkey"], data["response"]["passkey"]
+    except Exception as e:
+        print(f" Fallo crítico al obtener llaves: {e}")
+        return None, None
+
+def buscar_album(artista, album, authkey, passkey):
+    resultado_album = {"artist": artista, "album": album, "groups": []}
+    try:
+        r = requests.get(BASE_URL, headers=HEADERS, params={
+            "action": "browse", "artistname": artista, "groupname": album
+        }, timeout=10)
+        data = r.json()
+    except:
+        return resultado_album
+
+    if data.get("status") != "success" or not data.get("response"):
+        return resultado_album
+
+    for grupo in data["response"]["results"]:
+        group_id = grupo["groupId"]
+        time.sleep(1.5) # Rate limit preventivo
+
+        try:
+            r2 = requests.get(BASE_URL, headers=HEADERS, params={
+                "action": "torrentgroup", "id": group_id
+            }, timeout=10)
+            data2 = r2.json()
+            response_data = data2.get("response")
+            if not isinstance(response_data, dict): continue
+
+            torrents = response_data.get("torrents", [])
+        except:
+            continue
+
+        flacs = [t for t in torrents if t.get("format") == "FLAC"]
+        if not flacs: continue
+
+        grupo_info = {
+            "groupId": group_id,
+            "cover": grupo.get("cover"),
+            "webUrl": f"{NAS_URL}/torrents.php?id={group_id}",
+            "flacCount": len(flacs),
+            "torrents": []
+        }
+
+        for t in flacs:
+            grupo_info["torrents"].append({
+                "torrentId": t["id"],
+                "media": t.get("media"),
+                "encoding": t.get("encoding"),
+                "remasterYear": t.get("remasterYear"),
+                "remasterTitle": t.get("remasterTitle"),
+                "fileCount": t.get("fileCount"),
+                "size": t.get("size"),
+                "downloadUrl": f"{NAS_URL}/torrents.php?action=download&id={t['id']}&authkey={authkey}&torrent_pass={passkey}&usetoken=1"
+            })
+        resultado_album["groups"].append(grupo_info)
+    return resultado_album
+
+def sin_nas(artista, album):
+    """Sin NAS configurado el disco se muestra igual, solo sin descargas. El id
+    es numérico porque la web lo usa como groupId."""
+    gid = zlib.crc32(f"{artista.lower()}|{album.lower()}".encode()) | (1 << 40)
+    return {"artist": artista, "album": album, "groups": [
+        {"groupId": gid, "cover": None, "webUrl": None, "flacCount": 0, "torrents": []}]}
+
+
+def main():
+    # 1. Cargar historial para evitar duplicados
+    resultados_totales = []
+    procesados_set = set()
+    if os.path.exists(JSON_FILENAME):
+        with open(JSON_FILENAME, "r", encoding="utf-8") as f:
+            resultados_totales = json.load(f)
+            for item in resultados_totales:
+                procesados_set.add(f"{item['artist'].lower()}|{item['album'].lower()}")
+
+    hay_nas = bool(API_KEY and NAS_URL)
+    authkey = passkey = None
+    if hay_nas:
+        authkey, passkey = obtener_keys()
+        if not authkey: return
+
+    # 2. Leer CSV completo para poder reescribirlo después
+    filas_csv = []
+    with open(CSV_FILENAME, "r", encoding="utf-8") as csvfile:
+        reader = csv.reader(csvfile)
+        filas_csv = list(reader)[1:]
+
+    # 3. Procesar
+    print("🔍 Comprobando qué discos ya tienes en qBittorrent/Airsonic...")
+    torrent_names = qb_torrent_names()
+
+    for i, fila in enumerate(filas_csv):
+        if len(fila) < 2: continue
+
+        artista, album = fila[0].strip(), fila[1].strip()
+        # Si ya está en el JSON, saltar
+        if f"{artista.lower()}|{album.lower()}" in procesados_set:
+            continue
+
+        # Si ya lo tienes en Airsonic/qBittorrent, no tiene sentido buscarlo
+        # en el NAS ni mostrarlo como "nuevo" -- sería redundante.
+        if ya_lo_tengo(artista, album, torrent_names):
+            print(f" ⏭️  {artista} - {album}: ya lo tienes, se omite")
+            continue
+
+        print(f" Buscando: {artista} - {album}")
+        resultado = buscar_album(artista, album, authkey, passkey) if hay_nas else sin_nas(artista, album)
+
+        # Solo se guarda si hay algo que mostrar; lo que no aparezca se reintenta
+        if resultado["groups"]:
+            resultados_totales.append(resultado)
+            procesados_set.add(f"{artista.lower()}|{album.lower()}")
+            with open(JSON_FILENAME, "w", encoding="utf-8") as f:
+                json.dump(resultados_totales, f, indent=4, ensure_ascii=False)
+            print("  [+] Añadido.")
+        else:
+            print("  [-] Sin resultados FLAC.")
+
+        if hay_nas:
+            time.sleep(2) # Pausa amigable entre búsquedas
+
+    print("\n--- Tarea finalizada ---")
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,18 @@
+services:
+  dieta-sonora:
+    build: .
+    container_name: dieta-sonora
+    user: "${PUID:-1000}:${PGID:-1000}"
+    restart: unless-stopped
+    env_file:
+      - path: ./.env
+        required: false
+    volumes:
+      - ./data:/data
+      - ${WATCH_TORRENTS_HOST_PATH:-./data/watch_torrents}:/watch_torrents
+      - ./.env:/app/.env
+    ports:
+      - "5010:5001"
+    # Para poner QB_HOST=host.docker.internal si qBittorrent corre en el host.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

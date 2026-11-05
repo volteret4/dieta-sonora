@@ -1,0 +1,8 @@
+.env*
+!.env.example
+data/
+*.db*
+*.json
+*.csv
+__pycache__/
+resumen_flacs.html

@@ -1,0 +1,7 @@
+flask
+gunicorn
+requests
+icalendar
+caldav
+pytz
+qbittorrent-api
